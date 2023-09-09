@@ -85,10 +85,14 @@ module Oroutine : S = struct
     Fun.protect ~finally:(fun () -> Mutex.unlock mtx) f
 
   let spawn (q : run_queue) f =
-    Mutex.lock q.mtx;
-    Queue.push f q.v;
-    Condition.signal q.cond;
-    Mutex.unlock q.mtx
+    with_lock q.mtx (fun () ->
+        Queue.push f q.v;
+        Condition.signal q.cond)
+
+  let spawn_many (q : run_queue) fs =
+    with_lock q.mtx (fun () ->
+        Queue.add_seq q.v (List.to_seq fs);
+        Condition.broadcast q.cond)
 
   type _ Effect.t += Yield : unit Effect.t | Timeout : float -> unit Effect.t
 
@@ -129,7 +133,9 @@ module Oroutine : S = struct
               PrioQueue.peek_opt env.timed_tasks.v)
         with
         | None -> -1.0
-        | Some (t, _) -> t -. Unix.gettimeofday ()
+        | Some (t, _) ->
+            let v = t -. Unix.gettimeofday () in
+            if v < 0.0 then 0.0 else v
       in
       let read_fds, _write_fds, _ =
         Unix.select [ timed_pipe_read_fd ] [] [] next_timeout
@@ -150,7 +156,7 @@ module Oroutine : S = struct
             in
             aux [])
       in
-      ready_tasks |> List.iter (fun task -> spawn env.q task);
+      spawn_many env.q ready_tasks;
 
       loop ()
     in
@@ -195,10 +201,12 @@ end
 
 let () =
   for i = 0 to 10000 do
+    let duration = Random.float 20.0 in
+    debug_print "spawn 1 %d %f" i duration;
     Oroutine.(
       go (fun () ->
           let begin_time = Unix.gettimeofday () in
-          sleep 3.0;
+          sleep duration;
           let end_time = Unix.gettimeofday () in
           debug_print "done 2 %d %f" i (end_time -. begin_time);
           ()))
