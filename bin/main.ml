@@ -1,4 +1,4 @@
-[@@@warning "-69"]
+[@@@warning "-32-69"]
 
 let debug_print fmt =
   Printf.ksprintf
@@ -13,6 +13,7 @@ module type S = sig
   type task = unit -> unit
 
   val go : task -> unit
+  val yield : unit -> unit
 end
 
 module Oroutine : S = struct
@@ -20,6 +21,30 @@ module Oroutine : S = struct
   type processor = { dom : unit Domain.t }
   type run_queue = { v : task Queue.t; mtx : Mutex.t; cond : Condition.t }
   type env = { processors : processor array; q : run_queue }
+
+  let spawn q f =
+    Mutex.lock q.mtx;
+    Queue.push f q.v;
+    Condition.signal q.cond;
+    Mutex.unlock q.mtx
+
+  type _ Effect.t += Yield : unit Effect.t
+
+  let yield () = Effect.perform Yield
+
+  let handle_yield q f =
+    Effect.Deep.try_with f ()
+      Effect.Deep.
+        {
+          effc =
+            (fun (type a) (eff : a Effect.t) ->
+              match eff with
+              | Yield ->
+                  Some
+                    (fun (k : (a, _) continuation) ->
+                      spawn q (fun () -> continue k ()))
+              | _ -> None);
+        }
 
   let worker (q : run_queue) () =
     let rec loop should_lock =
@@ -30,16 +55,10 @@ module Oroutine : S = struct
       else
         let task = Queue.pop q.v in
         Mutex.unlock q.mtx;
-        (try task () with _ -> ());
+        (try handle_yield q task with _ -> ());
         loop true
     in
     loop true
-
-  let spawn env f =
-    Mutex.lock env.q.mtx;
-    Queue.push f env.q.v;
-    Condition.signal env.q.cond;
-    Mutex.unlock env.q.mtx
 
   let make_env () =
     let q =
@@ -52,14 +71,17 @@ module Oroutine : S = struct
             { dom = Domain.spawn (worker q) });
     }
 
+  (**)
   let global_env = make_env ()
-  let go f = spawn global_env f
+  let go f = spawn global_env.q f
 end
 
 let () =
   for i = 0 to 100 do
     Oroutine.(
       go (fun () ->
+          debug_print "done %d %d" i (fib 40);
+          yield ();
           debug_print "done %d %d" i (fib 40);
           ()))
   done;
