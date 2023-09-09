@@ -9,6 +9,56 @@ let debug_print fmt =
 
 let rec fib n = if n <= 1 then n else fib (n - 1) + fib (n - 2)
 
+module PrioQueue = struct
+  (* Thanks to: https://v2.ocaml.org/releases/4.01/htmlman/moduleexamples.html *)
+  type ('a, 'b) node =
+    | Leaf
+    | Branch of 'a * 'b * ('a, 'b) node * ('a, 'b) node
+
+  type ('a, 'b) t = { mutable root : ('a, 'b) node }
+
+  let make () : ('a, 'b) t = { root = Leaf }
+
+  let rec insert' q prio elt =
+    match q with
+    | Leaf -> Branch (prio, elt, Leaf, Leaf)
+    | Branch (p, e, left, right) ->
+        if prio <= p then Branch (prio, elt, insert' right p e, left)
+        else Branch (p, e, insert' right prio elt, left)
+
+  let insert q prio elt = q.root <- insert' q.root prio elt
+
+  exception Queue_is_empty
+
+  let rec remove_top = function
+    | Leaf -> raise Queue_is_empty
+    | Branch (_, _, left, Leaf) -> left
+    | Branch (_, _, Leaf, right) -> right
+    | Branch
+        ( _,
+          _,
+          (Branch (lprio, lelt, _, _) as left),
+          (Branch (rprio, relt, _, _) as right) ) ->
+        if lprio <= rprio then Branch (lprio, lelt, remove_top left, right)
+        else Branch (rprio, relt, left, remove_top right)
+
+  let extract' = function
+    | Leaf -> raise Queue_is_empty
+    | Branch (prio, elt, _, _) as queue -> (prio, elt, remove_top queue)
+
+  let extract q =
+    let prio, elt, queue = extract' q.root in
+    q.root <- queue;
+    (prio, elt)
+
+  let extract_opt q = try Some (extract q) with Queue_is_empty -> None
+
+  let peek_opt q =
+    match q.root with
+    | Leaf -> None
+    | Branch (prio, elt, _, _) -> Some (prio, elt)
+end
+
 module type S = sig
   type task = unit -> unit
 
@@ -21,9 +71,20 @@ module Oroutine : S = struct
   type task = unit -> unit
   type processor = { dom : unit Domain.t }
   type run_queue = { v : task Queue.t; mtx : Mutex.t; cond : Condition.t }
-  type env = { processors : processor array; q : run_queue }
+  type 'a with_mutex = { mtx : Mutex.t; v : 'a }
 
-  let spawn q f =
+  type env = {
+    q : run_queue;
+    timed_tasks : (float (* end time *), task) PrioQueue.t with_mutex;
+        (* should be sorted by end time in acending order *)
+    timed_pipe_fds : Unix.file_descr * Unix.file_descr;
+  }
+
+  let with_lock mtx f =
+    Mutex.lock mtx;
+    Fun.protect ~finally:(fun () -> Mutex.unlock mtx) f
+
+  let spawn (q : run_queue) f =
     Mutex.lock q.mtx;
     Queue.push f q.v;
     Condition.signal q.cond;
@@ -34,7 +95,7 @@ module Oroutine : S = struct
   let yield () = Effect.perform Yield
   let sleep duration = Effect.perform (Timeout duration)
 
-  let handle_yield q f =
+  let handle_yield env f =
     Effect.Deep.try_with f ()
       Effect.Deep.
         {
@@ -44,29 +105,67 @@ module Oroutine : S = struct
               | Yield ->
                   Some
                     (fun (k : (a, _) continuation) ->
-                      spawn q (fun () -> continue k ()))
+                      spawn env.q (fun () -> continue k ()))
               | Timeout duration ->
                   Some
                     (fun (k : (a, _) continuation) ->
-                      Thread.create
-                        (fun () ->
-                          Unix.sleepf duration;
-                          spawn q (fun () -> continue k ()))
-                        ()
-                      |> ignore)
+                      let end_time = Unix.gettimeofday () +. duration in
+                      with_lock env.timed_tasks.mtx (fun () ->
+                          PrioQueue.insert env.timed_tasks.v end_time (fun () ->
+                              continue k ()));
+                      Unix.write (snd env.timed_pipe_fds) (Bytes.make 1 '1') 0 1
+                      (* FIXME: handle error *)
+                      |> ignore;
+                      ())
               | _ -> None);
         }
 
-  let worker (q : run_queue) () =
+  let select_worker env () =
+    let timed_pipe_read_fd = fst env.timed_pipe_fds in
+    let rec loop () =
+      let next_timeout =
+        match
+          with_lock env.timed_tasks.mtx (fun () ->
+              PrioQueue.peek_opt env.timed_tasks.v)
+        with
+        | None -> -1.0
+        | Some (t, _) -> t -. Unix.gettimeofday ()
+      in
+      let read_fds, _write_fds, _ =
+        Unix.select [ timed_pipe_read_fd ] [] [] next_timeout
+      in
+
+      if read_fds |> List.find_opt (( = ) timed_pipe_read_fd) |> Option.is_some
+      then Unix.read timed_pipe_read_fd (Bytes.make 1 '0') 0 1 |> ignore;
+
+      let now = Unix.gettimeofday () in
+      let ready_tasks =
+        with_lock env.timed_tasks.mtx (fun () ->
+            let rec aux ready =
+              match PrioQueue.peek_opt env.timed_tasks.v with
+              | Some (t, task) when t <= now ->
+                  PrioQueue.extract env.timed_tasks.v |> ignore;
+                  aux (task :: ready)
+              | _ -> ready
+            in
+            aux [])
+      in
+      ready_tasks |> List.iter (fun task -> spawn env.q task);
+
+      loop ()
+    in
+    loop ()
+
+  let worker env () =
     let rec loop should_lock =
-      if should_lock then Mutex.lock q.mtx;
-      if Queue.is_empty q.v then (
-        Condition.wait q.cond q.mtx;
+      if should_lock then Mutex.lock env.q.mtx;
+      if Queue.is_empty env.q.v then (
+        Condition.wait env.q.cond env.q.mtx;
         loop false)
       else
-        let task = Queue.pop q.v in
-        Mutex.unlock q.mtx;
-        (try handle_yield q task with _ -> ());
+        let task = Queue.pop env.q.v in
+        Mutex.unlock env.q.mtx;
+        (try handle_yield env task with _ -> ());
         loop true
     in
     loop true
@@ -75,12 +174,19 @@ module Oroutine : S = struct
     let q =
       { v = Queue.create (); mtx = Mutex.create (); cond = Condition.create () }
     in
-    {
-      q;
-      processors =
-        Array.init (Domain.recommended_domain_count ()) (fun _ ->
-            { dom = Domain.spawn (worker q) });
-    }
+    let env =
+      {
+        q;
+        timed_tasks = { mtx = Mutex.create (); v = PrioQueue.make () };
+        timed_pipe_fds = Unix.pipe ~cloexec:true ();
+      }
+    in
+    let _processors =
+      Array.init (Domain.recommended_domain_count ()) (fun _ ->
+          { dom = Domain.spawn (worker env) })
+    in
+    spawn q (select_worker env);
+    env
 
   (**)
   let global_env = make_env ()
@@ -88,7 +194,7 @@ module Oroutine : S = struct
 end
 
 let () =
-  for i = 0 to 100 do
+  for i = 0 to 10000 do
     Oroutine.(
       go (fun () ->
           let begin_time = Unix.gettimeofday () in
@@ -98,6 +204,6 @@ let () =
           ()))
   done;
   debug_print "waiting";
-  Unix.sleep 10;
+  Unix.sleep 100;
   debug_print "timeout";
   ()
