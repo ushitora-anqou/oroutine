@@ -1,4 +1,4 @@
 (executable
  (public_name oroutine)
  (name main)
- (libraries oroutine))
+ (libraries oroutine unix threads))
