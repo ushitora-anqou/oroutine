@@ -14,6 +14,7 @@ module type S = sig
 
   val go : task -> unit
   val yield : unit -> unit
+  val sleep : float -> unit
 end
 
 module Oroutine : S = struct
@@ -28,9 +29,10 @@ module Oroutine : S = struct
     Condition.signal q.cond;
     Mutex.unlock q.mtx
 
-  type _ Effect.t += Yield : unit Effect.t
+  type _ Effect.t += Yield : unit Effect.t | Timeout : float -> unit Effect.t
 
   let yield () = Effect.perform Yield
+  let sleep duration = Effect.perform (Timeout duration)
 
   let handle_yield q f =
     Effect.Deep.try_with f ()
@@ -43,6 +45,15 @@ module Oroutine : S = struct
                   Some
                     (fun (k : (a, _) continuation) ->
                       spawn q (fun () -> continue k ()))
+              | Timeout duration ->
+                  Some
+                    (fun (k : (a, _) continuation) ->
+                      Thread.create
+                        (fun () ->
+                          Unix.sleepf duration;
+                          spawn q (fun () -> continue k ()))
+                        ()
+                      |> ignore)
               | _ -> None);
         }
 
@@ -80,9 +91,10 @@ let () =
   for i = 0 to 100 do
     Oroutine.(
       go (fun () ->
-          debug_print "done %d %d" i (fib 40);
-          yield ();
-          debug_print "done %d %d" i (fib 40);
+          let begin_time = Unix.gettimeofday () in
+          sleep 3.0;
+          let end_time = Unix.gettimeofday () in
+          debug_print "done 2 %d %f" i (end_time -. begin_time);
           ()))
   done;
   debug_print "waiting";
