@@ -71,14 +71,15 @@ module Oroutine : S = struct
   type task = unit -> unit
   type processor = { dom : unit Domain.t }
   type run_queue = { v : task Queue.t; mtx : Mutex.t; cond : Condition.t }
-  type 'a with_mutex = { mtx : Mutex.t; v : 'a }
 
-  type env = {
-    q : run_queue;
-    timed_tasks : (float (* end time *), task) PrioQueue.t with_mutex;
-        (* should be sorted by end time in acending order *)
-    timed_pipe_fds : Unix.file_descr * Unix.file_descr;
+  type timed_tasks_info = {
+    q : (float (* end time *), task) PrioQueue.t;
+    mtx : Mutex.t;
+    read_fd : Unix.file_descr;
+    write_fd : Unix.file_descr;
   }
+
+  type env = { q : run_queue; timed : timed_tasks_info }
 
   let with_lock mtx f =
     Mutex.lock mtx;
@@ -114,10 +115,10 @@ module Oroutine : S = struct
                   Some
                     (fun (k : (a, _) continuation) ->
                       let end_time = Unix.gettimeofday () +. duration in
-                      with_lock env.timed_tasks.mtx (fun () ->
-                          PrioQueue.insert env.timed_tasks.v end_time (fun () ->
+                      with_lock env.timed.mtx (fun () ->
+                          PrioQueue.insert env.timed.q end_time (fun () ->
                               continue k ()));
-                      Unix.write (snd env.timed_pipe_fds) (Bytes.make 1 '1') 0 1
+                      Unix.write env.timed.write_fd (Bytes.make 1 '1') 0 1
                       (* FIXME: handle error *)
                       |> ignore;
                       ())
@@ -125,12 +126,10 @@ module Oroutine : S = struct
         }
 
   let select_worker env () =
-    let timed_pipe_read_fd = fst env.timed_pipe_fds in
     let rec loop () =
       let next_timeout =
         match
-          with_lock env.timed_tasks.mtx (fun () ->
-              PrioQueue.peek_opt env.timed_tasks.v)
+          with_lock env.timed.mtx (fun () -> PrioQueue.peek_opt env.timed.q)
         with
         | None -> -1.0
         | Some (t, _) ->
@@ -138,19 +137,19 @@ module Oroutine : S = struct
             if v < 0.0 then 0.0 else v
       in
       let read_fds, _write_fds, _ =
-        Unix.select [ timed_pipe_read_fd ] [] [] next_timeout
+        Unix.select [ env.timed.read_fd ] [] [] next_timeout
       in
 
-      if read_fds |> List.find_opt (( = ) timed_pipe_read_fd) |> Option.is_some
-      then Unix.read timed_pipe_read_fd (Bytes.make 1 '0') 0 1 |> ignore;
+      if read_fds |> List.find_opt (( = ) env.timed.read_fd) |> Option.is_some
+      then Unix.read env.timed.read_fd (Bytes.make 1 '0') 0 1 |> ignore;
 
       let now = Unix.gettimeofday () in
       let ready_tasks =
-        with_lock env.timed_tasks.mtx (fun () ->
+        with_lock env.timed.mtx (fun () ->
             let rec aux ready =
-              match PrioQueue.peek_opt env.timed_tasks.v with
+              match PrioQueue.peek_opt env.timed.q with
               | Some (t, task) when t <= now ->
-                  PrioQueue.extract env.timed_tasks.v |> ignore;
+                  PrioQueue.extract env.timed.q |> ignore;
                   aux (task :: ready)
               | _ -> ready
             in
@@ -181,10 +180,11 @@ module Oroutine : S = struct
       { v = Queue.create (); mtx = Mutex.create (); cond = Condition.create () }
     in
     let env =
+      let read_fd, write_fd = Unix.pipe ~cloexec:true () in
       {
         q;
-        timed_tasks = { mtx = Mutex.create (); v = PrioQueue.make () };
-        timed_pipe_fds = Unix.pipe ~cloexec:true ();
+        timed =
+          { mtx = Mutex.create (); q = PrioQueue.make (); read_fd; write_fd };
       }
     in
     let _processors =
