@@ -1,4 +1,4 @@
-[@@@warning "-32-69"]
+[@@@warning "-26-32-69"]
 
 let debug_print fmt =
   Printf.ksprintf
@@ -111,18 +111,7 @@ module Oroutine : S = struct
 
   let schedule env tasks =
     let nprocs = Array.length env.qs in
-    match tasks with
-    | [] -> ()
-    | [ x ] -> spawn env.qs.(Random.int nprocs) x
-    | _ ->
-        let plan = Array.make nprocs [] in
-        tasks
-        |> List.iteri (fun i task ->
-               plan.(i mod nprocs) <- task :: plan.(i mod nprocs));
-        let offset = Random.int nprocs in
-        plan
-        |> Array.iteri (fun i tasks ->
-               spawn_many env.qs.((i + offset) mod nprocs) tasks)
+    spawn_many env.qs.(Random.int nprocs) tasks
 
   let handle_yield env f =
     let q = env.qs.(env.wid) in
@@ -151,16 +140,14 @@ module Oroutine : S = struct
         }
 
   let select_worker env () =
-    let rec loop () =
+    let rec loop next_end_time =
       let next_timeout =
-        match
-          with_lock env.timed.mtx (fun () -> PrioQueue.peek_opt env.timed.q)
-        with
-        | None -> -1.0
-        | Some (t, _) ->
-            let v = t -. Unix.gettimeofday () in
-            if v < 0.0 then 0.0 else v
+        next_end_time
+        |> Option.fold ~none:(-1.0) ~some:(fun t ->
+               let v = t -. Unix.gettimeofday () in
+               if v < 0.0 then 0.0 else v)
       in
+
       let read_fds, _write_fds, _ =
         Unix.select [ env.timed.read_fd ] [] [] next_timeout
       in
@@ -169,22 +156,23 @@ module Oroutine : S = struct
       then Unix.read env.timed.read_fd (Bytes.make 1 '0') 0 1 |> ignore;
 
       let now = Unix.gettimeofday () in
-      let ready_tasks =
+      let next_end_time, ready_tasks =
         with_lock env.timed.mtx (fun () ->
             let rec aux ready =
               match PrioQueue.peek_opt env.timed.q with
               | Some (t, task) when t <= now ->
                   PrioQueue.extract env.timed.q |> ignore;
                   aux (task :: ready)
-              | _ -> ready
+              | Some (t, _) -> (Some t, ready)
+              | None -> (None, ready)
             in
             aux [])
       in
       schedule env ready_tasks;
 
-      loop ()
+      loop next_end_time
     in
-    try loop ()
+    try loop None
     with e ->
       debug_print "select_worker: %s\n%s" (Printexc.to_string e)
         (Printexc.get_backtrace ())
