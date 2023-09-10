@@ -219,7 +219,7 @@ module Oroutine : S = struct
       }
     in
     let _processors =
-      Array.init (Domain.recommended_domain_count ()) (fun i ->
+      Array.init num_workers (fun i ->
           { dom = Domain.spawn (worker { env with wid = i }) })
     in
     Domain.spawn (select_worker env) |> ignore;
