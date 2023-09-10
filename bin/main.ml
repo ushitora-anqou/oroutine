@@ -8,6 +8,15 @@ let debug_print fmt =
     fmt
 
 let rec fib n = if n <= 1 then n else fib (n - 1) + fib (n - 2)
+let iota n = List.init n (fun i -> i)
+
+let list_take n l =
+  let rec aux acc n = function
+    | rest when n = 0 -> (List.rev acc, rest)
+    | [] -> (List.rev acc, [])
+    | x :: xs -> aux (x :: acc) (n - 1) xs
+  in
+  aux [] n l
 
 module PrioQueue = struct
   (* Thanks to: https://v2.ocaml.org/releases/4.01/htmlman/moduleexamples.html *)
@@ -79,7 +88,7 @@ module Oroutine : S = struct
     write_fd : Unix.file_descr;
   }
 
-  type env = { q : run_queue; timed : timed_tasks_info }
+  type env = { qs : run_queue array; timed : timed_tasks_info; wid : int }
 
   let with_lock mtx f =
     Mutex.lock mtx;
@@ -101,6 +110,7 @@ module Oroutine : S = struct
   let sleep duration = Effect.perform (Timeout duration)
 
   let handle_yield env f =
+    let q = env.qs.(env.wid) in
     Effect.Deep.try_with f ()
       Effect.Deep.
         {
@@ -110,7 +120,7 @@ module Oroutine : S = struct
               | Yield ->
                   Some
                     (fun (k : (a, _) continuation) ->
-                      spawn env.q (fun () -> continue k ()))
+                      spawn q (fun () -> continue k ()))
               | Timeout duration ->
                   Some
                     (fun (k : (a, _) continuation) ->
@@ -155,63 +165,86 @@ module Oroutine : S = struct
             in
             aux [])
       in
-      spawn_many env.q ready_tasks;
+
+      (* Schedule ready tasks *)
+      (let nprocs = Array.length env.qs in
+       let plan = Array.make nprocs [] in
+       ready_tasks
+       |> List.iteri (fun i task ->
+              plan.(i mod nprocs) <- task :: plan.(i mod nprocs));
+       let offset = Random.int nprocs in
+       plan
+       |> Array.iteri (fun i tasks ->
+              spawn_many env.qs.((i + offset) mod nprocs) tasks));
 
       loop ()
     in
-    loop ()
+    try loop ()
+    with e ->
+      debug_print "select_worker: %s\n%s" (Printexc.to_string e)
+        (Printexc.get_backtrace ())
 
   let worker env () =
+    let q = env.qs.(env.wid) in
     let rec loop should_lock =
-      if should_lock then Mutex.lock env.q.mtx;
-      if Queue.is_empty env.q.v then (
-        Condition.wait env.q.cond env.q.mtx;
+      if should_lock then Mutex.lock q.mtx;
+      if Queue.is_empty q.v then (
+        Condition.wait q.cond q.mtx;
         loop false)
       else
-        let task = Queue.pop env.q.v in
-        Mutex.unlock env.q.mtx;
+        let task = Queue.pop q.v in
+        Mutex.unlock q.mtx;
         (try handle_yield env task with _ -> ());
         loop true
     in
     loop true
 
   let make_env () =
-    let q =
-      { v = Queue.create (); mtx = Mutex.create (); cond = Condition.create () }
+    let num_workers = Domain.recommended_domain_count () in
+    let qs =
+      Array.init num_workers (fun _ ->
+          {
+            v = Queue.create ();
+            mtx = Mutex.create ();
+            cond = Condition.create ();
+          })
     in
     let env =
       let read_fd, write_fd = Unix.pipe ~cloexec:true () in
       {
-        q;
+        wid = 0 (* dummy *);
+        qs;
         timed =
           { mtx = Mutex.create (); q = PrioQueue.make (); read_fd; write_fd };
       }
     in
     let _processors =
-      Array.init (Domain.recommended_domain_count ()) (fun _ ->
-          { dom = Domain.spawn (worker env) })
+      Array.init (Domain.recommended_domain_count ()) (fun i ->
+          { dom = Domain.spawn (worker { env with wid = i }) })
     in
-    spawn q (select_worker env);
+    Domain.spawn (select_worker env) |> ignore;
     env
 
   (**)
   let global_env = make_env ()
-  let go f = spawn global_env.q f
+  let go f = spawn global_env.qs.(0) f
 end
 
 let () =
-  for i = 0 to 10000 do
-    let duration = Random.float 20.0 in
-    debug_print "spawn 1 %d %f" i duration;
+  let root_time = Unix.gettimeofday () in
+  for i = 0 to 100000 do
+    (*debug_print "spawn 1 %d %f" i duration;*)
     Oroutine.(
       go (fun () ->
           let begin_time = Unix.gettimeofday () in
-          sleep duration;
+          sleep (float_of_int i *. 0.0001);
           let end_time = Unix.gettimeofday () in
-          debug_print "done 2 %d %f" i (end_time -. begin_time);
+          if i mod 1000 = 0 then
+            debug_print "done 2 %d %f %f" i (end_time -. begin_time)
+              (end_time -. root_time);
           ()))
   done;
-  debug_print "waiting";
-  Unix.sleep 100;
+  debug_print "waiting %f" (Unix.gettimeofday () -. root_time);
+  Unix.sleep 200;
   debug_print "timeout";
   ()
