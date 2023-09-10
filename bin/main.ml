@@ -109,6 +109,21 @@ module Oroutine : S = struct
   let yield () = Effect.perform Yield
   let sleep duration = Effect.perform (Timeout duration)
 
+  let schedule env tasks =
+    let nprocs = Array.length env.qs in
+    match tasks with
+    | [] -> ()
+    | [ x ] -> spawn env.qs.(Random.int nprocs) x
+    | _ ->
+        let plan = Array.make nprocs [] in
+        tasks
+        |> List.iteri (fun i task ->
+               plan.(i mod nprocs) <- task :: plan.(i mod nprocs));
+        let offset = Random.int nprocs in
+        plan
+        |> Array.iteri (fun i tasks ->
+               spawn_many env.qs.((i + offset) mod nprocs) tasks)
+
   let handle_yield env f =
     let q = env.qs.(env.wid) in
     Effect.Deep.try_with f ()
@@ -165,17 +180,7 @@ module Oroutine : S = struct
             in
             aux [])
       in
-
-      (* Schedule ready tasks *)
-      (let nprocs = Array.length env.qs in
-       let plan = Array.make nprocs [] in
-       ready_tasks
-       |> List.iteri (fun i task ->
-              plan.(i mod nprocs) <- task :: plan.(i mod nprocs));
-       let offset = Random.int nprocs in
-       plan
-       |> Array.iteri (fun i tasks ->
-              spawn_many env.qs.((i + offset) mod nprocs) tasks));
+      schedule env ready_tasks;
 
       loop ()
     in
@@ -227,7 +232,7 @@ module Oroutine : S = struct
 
   (**)
   let global_env = make_env ()
-  let go f = spawn global_env.qs.(0) f
+  let go f = schedule global_env [ f ]
 end
 
 let () =
